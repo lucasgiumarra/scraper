@@ -1,0 +1,43 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+
+# Local databases and dumps
+*.db
+*.sqlite
+next_data.json
+product_info.jsonl
+results.txt
+amazon_market.db
+
+# Debug / scraper artifacts
+*.png
+walmart_error.html
+brd_proxy_auth.zip
+debug_timeout.png
+
+# Local-only scripts and notes (not pushed)
+database.py
+prompt.md
+test.py
+test_amazon_scraper.py
+walmart_scraper.py
+walmart_test.py
+
+brd_proxy_ext/
+
+# IDE
+.idea/
+.vscode/
