@@ -21,11 +21,73 @@ import undetected_chromedriver as uc
 from curl_cffi import requests
 from bs4 import BeautifulSoup
 from selenium.common.exceptions import TimeoutException
-from webdriver_manager.chrome import ChromeDriverManager
+import traceback
 from selenium.webdriver.chromium.remote_connection import ChromiumRemoteConnection as Connection
 
 
 load_dotenv()
+
+
+def _gather_exception_chain_text(exc: BaseException) -> str:
+    """Flatten __cause__ / __context__ so urllib3/http errors under Selenium are visible."""
+    parts: list[str] = []
+    seen: set[int] = set()
+    stack: list[BaseException | None] = [exc]
+    while stack:
+        cur = stack.pop()
+        if cur is None or id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        parts.append(type(cur).__qualname__)
+        parts.append(repr(cur))
+        parts.append(str(cur))
+        c = getattr(cur, "__cause__", None)
+        if c is not None:
+            stack.append(c)
+        ctx = getattr(cur, "__context__", None)
+        if ctx is not None and ctx is not c:
+            stack.append(ctx)
+    return " ".join(parts).lower()
+
+
+def _driver_fatal_exception(exc: BaseException) -> bool:
+    """
+    True when the remote Selenium / Bright Data session is likely dead or the HTTP
+    tunnel dropped (e.g. RemoteDisconnected). Caller should restart the driver.
+    """
+    text = _gather_exception_chain_text(exc)
+    needles = (
+        "websocket",
+        "not open",
+        "chrome not reachable",
+        "invalid session",
+        "no such session",
+        "session deleted",
+        "read timed out",
+        "internal server error",
+        "connection aborted",
+        "remotedisconnected",
+        "remote end closed connection",
+        "connection reset",
+        "broken pipe",
+        "max retries exceeded",
+        "newconnectionerror",
+        "failed to establish",
+        "actively refused",
+        "unexpected_eof",
+        "eof occurred",
+        "bad gateway",
+        "502",
+        "503",
+    )
+    if any(n in text for n in needles):
+        return True
+    # Selenium often surfaces a bare "Message:" when the wire died with no JSON body
+    stripped = str(exc).strip()
+    if stripped in ("Message:", "") or stripped.lower() == "message:":
+        return True
+    return False
+
 
 class UnifiedMarketDB:
     def __init__(self, db_name="market_intelligence.db"):
@@ -344,15 +406,14 @@ class UnifiedScraper:
             return driver.execute('executeCdpCommand', {'cmd': cmd, 'params': params})['value']
 
         try:
-            # Get frame info for CDP
-            frames = cdp('Page.getFrameTree')
-            frame_id = frames['frameTree']['frame']['id']
+            # Bound navigation / scripts before any network (Bright Data can hang on dead sessions)
+            driver.set_page_load_timeout(75)
+            driver.set_script_timeout(75)
 
-            driver.set_page_load_timeout(90)
-            
+            cdp("Page.getFrameTree")
+
             driver.get(product_url)
-            # Increase wait time to 30s to allow Bright Data solver to work
-            wait = WebDriverWait(driver, 30) 
+            wait = WebDriverWait(driver, 30)
             wait.until(EC.presence_of_element_located((By.ID, "__NEXT_DATA__")))
 
             html = None
@@ -402,30 +463,11 @@ class UnifiedScraper:
 
             
         except Exception as e:
-            error_msg = str(e)
-            print(f"Failed to process URL: {product_url}. Error: {error_msg}")
-
-            # Expanded critical failure list to catch network & session drops
-            fatal_errors = [
-                "websocket is not open", 
-                "chrome not reachable", 
-                "invalid session id", 
-                "no_peers", 
-                "timeout",              # Catches DOM renderer timeouts
-                "read timed out",       # NEW: Catches urllib3 connection drops
-                "session",              # NEW: Catches 'Session "..." not found'
-                "internal server error" # NEW: Catches Bright Data 500 errors
-            ]
-            
-            if any(fatal in error_msg for fatal in fatal_errors):
-                raise e 
-
-            # If the remote browser disconnected, the driver is dead. Raise the error!
-            if "WebSocket is not open" in error_msg or "chrome not reachable" in error_msg or "invalid session id" in error_msg.lower():
-                raise e 
-                
+            print(f"Failed to process URL: {product_url}. Error: {e!r}")
+            if _driver_fatal_exception(e):
+                print("[Walmart] Fatal transport/session error — restarting browser on next iteration.")
+                raise e
             return None
-            
 
 def get_product_links_from_search_page(driver, query, page_number=1):
         def cdp(cmd, params=None):
@@ -442,9 +484,9 @@ def get_product_links_from_search_page(driver, query, page_number=1):
         print(f"[Walmart] Searching for: {query}")
 
         try:
-            # 1. Set explicit timeout so it NEVER hangs forever (throws error after 90s)
-            driver.set_page_load_timeout(90)
-            
+            driver.set_page_load_timeout(75)
+            driver.set_script_timeout(75)
+
             driver.get(search_url)
             
             # 2. Wait explicitly for the page data to load, NOT a random time.sleep()
@@ -503,14 +545,42 @@ def get_product_links_from_search_page(driver, query, page_number=1):
             return product_links
 
         except Exception as e:
-            error_msg = str(e)
-            print(f"Failed to get product links for query: {query}. Error {error_msg}")
-            
-            # If the browser deadlocked or timed out, bubble the error up to trigger the restart
-            if "timeout" in error_msg.lower() or "not open" in error_msg:
+            print(f"Failed to get product links for query: {query}. Error {e!r}")
+            err_lower = str(e).lower()
+            if _driver_fatal_exception(e) or "timeout" in err_lower:
                 raise e
-                
             return []
+
+
+def _refresh_walmart_driver(bot, driver):
+    """Safely close Bright Data / remote driver and open a new one."""
+    try:
+        if driver is not None:
+            driver.quit()
+    except Exception:
+        pass
+    return bot._get_selenium_driver(use_brd=True)
+
+
+def _fetch_search_links_with_retries(bot, driver, category, max_attempts=3):
+    """
+    Walmart search often hits Selenium timeouts; those used to kill the whole run
+    because get_product_links_from_search_page re-raises. Retry with a fresh driver.
+    """
+    current = driver
+    for attempt in range(1, max_attempts + 1):
+        try:
+            links = get_product_links_from_search_page(current, category, page_number=1)
+            return current, links
+        except Exception as e:
+            print(f"[Walmart] Search failed for {category!r} (attempt {attempt}/{max_attempts}): {e}")
+            traceback.print_exc()
+            if attempt < max_attempts:
+                print("[Walmart] Restarting browser before retry...")
+                current = _refresh_walmart_driver(bot, current)
+            else:
+                print(f"[Walmart] Giving up on search for {category!r} after {max_attempts} attempts.")
+    return current, []
 
 
 # --- REFINED MAIN EXECUTION ---
@@ -536,39 +606,49 @@ if __name__ == "__main__":
 
     # Task B: Walmart (Using Bright Data Scraping Browser)
     print("--- Starting Walmart Phase ---")
-    walmart_driver = bot._get_selenium_driver(use_brd=True)
+    walmart_driver = None
     product_counter = 0
-    SESSION_LIMIT = 5 # Refresh driver every 5 products
+    SESSION_LIMIT = 5  # Refresh driver every 5 products
 
-    for cat, floor in market_pov_config.items():
-        product_links = get_product_links_from_search_page(walmart_driver, cat, page_number=1)
-
-        for link in product_links:
-            # 1. Standard Session Rotation
-            if product_counter >= SESSION_LIMIT:
-                print("♻️ Rotating Session to avoid detection/fatigue...")
-                try: walmart_driver.quit()
-                except: pass
-                walmart_driver = bot._get_selenium_driver(use_brd=True)
-                product_counter = 0
-
-            # 2. Self-Healing Execution Block
+    try:
+        walmart_driver = bot._get_selenium_driver(use_brd=True)
+        for cat, floor in market_pov_config.items():
             try:
-                result = bot.scrape_walmart(walmart_driver, link, floor)
-                if result:
-                    product_counter += 1
-            except Exception as e:
-                print("⚠️ Critical session failure (WebSocket Closed). Forcing driver restart...")
-                try: walmart_driver.quit()
-                except: pass # Ignore errors if it's already dead
-                
-                # Spin up a fresh driver for the remaining links
-                walmart_driver = bot._get_selenium_driver(use_brd=True)
-                product_counter = 0
-            
-            time.sleep(random.uniform(2, 5))
+                walmart_driver, product_links = _fetch_search_links_with_retries(
+                    bot, walmart_driver, cat, max_attempts=3
+                )
+                if not product_links:
+                    print(f"[Walmart] No links for category {cat!r}; continuing.")
+                    continue
 
-    try: walmart_driver.quit()
-    except: pass
-    
+                for link in product_links:
+                    if product_counter >= SESSION_LIMIT:
+                        print("♻️ Rotating Session to avoid detection/fatigue...")
+                        walmart_driver = _refresh_walmart_driver(bot, walmart_driver)
+                        product_counter = 0
+
+                    try:
+                        result = bot.scrape_walmart(walmart_driver, link, floor)
+                        if result:
+                            product_counter += 1
+                    except Exception as e:
+                        print(f"⚠️ Scrape/session failure on product: {e}")
+                        traceback.print_exc()
+                        walmart_driver = _refresh_walmart_driver(bot, walmart_driver)
+                        product_counter = 0
+
+                    time.sleep(random.uniform(2, 5))
+            except Exception as e:
+                print(f"⚠️ Category {cat!r} aborted: {e}")
+                traceback.print_exc()
+                walmart_driver = _refresh_walmart_driver(bot, walmart_driver)
+                product_counter = 0
+                continue
+    finally:
+        try:
+            if walmart_driver is not None:
+                walmart_driver.quit()
+        except Exception:
+            pass
+
     bot.report_deals()
