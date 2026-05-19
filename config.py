@@ -18,7 +18,7 @@ CATEGORIES: dict[str, float] = {
     "coffee maker":          30,
     "stand mixer":           50,
     "pressure cooker":       30,
-    "furniture":             100, 
+    "furniture":             100,
     # Wearables
     "smartwatch":            50,
     "fitness tracker":       30,

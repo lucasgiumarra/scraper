@@ -27,6 +27,7 @@ amazon_market.db
 walmart_error.html
 brd_proxy_auth.zip
 debug_timeout.png
+watchlist.json
 
 # Local-only scripts and notes (not pushed)
 database.py
@@ -42,3 +43,4 @@ brd_proxy_ext/
 # IDE
 .idea/
 .vscode/
+.gitignore

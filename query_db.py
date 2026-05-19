@@ -12,11 +12,13 @@ Usage:
     python query_db.py --query search --filter macbook
 """
 
+import os
 import sqlite3
 import argparse
-from datetime import date
+from dotenv import load_dotenv
 
-DB = "market_intelligence.db"
+load_dotenv()
+DB = os.getenv("DB")
 
 
 def connect():
@@ -183,8 +185,7 @@ MENU = """
 
 
 def interactive(conn):
-    key_map = {"1": "summary", "2": "prices", "3": "drops",
-                "4": "history", "5": "cheapest", "6": "category", "7": "search"}
+    key_map = {"1": "summary", "2": "prices", "3": "drops","4": "history", "5": "cheapest", "6": "category", "7": "search"}
     while True:
         print(MENU)
         choice = input("  Choose: ").strip().lower()
