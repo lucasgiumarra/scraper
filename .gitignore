@@ -35,6 +35,7 @@ test.py
 test_amazon_scraper.py
 walmart_scraper.py
 walmart_test.py
+CLAUDE.md
 
 brd_proxy_ext/
 

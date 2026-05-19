@@ -1,4 +1,3 @@
-from itertools import product
 import sqlite3
 import re
 import random
@@ -6,19 +5,14 @@ import time
 import os
 import json
 from datetime import datetime
+from urllib.parse import quote_plus
 from dotenv import load_dotenv
 
 # Web Engines
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver import Remote, ChromeOptions as Options
+# from selenium.webdriver import ChromeOptions as Options
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
-import undetected_chromedriver as uc
-from curl_cffi import requests
 from bs4 import BeautifulSoup
 from selenium.common.exceptions import TimeoutException
 import traceback
@@ -50,11 +44,33 @@ def _gather_exception_chain_text(exc: BaseException) -> str:
     return " ".join(parts).lower()
 
 
+def _brd_fetch_page_html(driver) -> str:
+    """Pull live DOM HTML from Bright Data Scraping Browser via CDP (Walmart-style)."""
+
+    def cdp(cmd, params=None):
+        if params is None:
+            params = {}
+        return driver.execute("executeCdpCommand", {"cmd": cmd, "params": params})["value"]
+
+    try:
+        root_node = cdp("DOM.getDocument")
+        outer_html = cdp("DOM.getOuterHTML", {"nodeId": root_node["root"]["nodeId"]})
+        html = outer_html.get("outerHTML")
+        if html and len(html) > 500:
+            return html
+    except Exception as e:
+        print(f"[BRD] CDP DOM fetch failed: {e}")
+    return driver.page_source
+
+
 def _driver_fatal_exception(exc: BaseException) -> bool:
     """
     True when the remote Selenium / Bright Data session is likely dead or the HTTP
     tunnel dropped (e.g. RemoteDisconnected). Caller should restart the driver.
     """
+    if isinstance(exc, TimeoutException):
+        return False
+
     text = _gather_exception_chain_text(exc)
     needles = (
         "websocket",
@@ -85,7 +101,7 @@ def _driver_fatal_exception(exc: BaseException) -> bool:
     # Selenium often surfaces a bare "Message:" when the wire died with no JSON body
     stripped = str(exc).strip()
     if stripped in ("Message:", "") or stripped.lower() == "message:":
-        return True
+        return "timeoutexception" not in text
     return False
 
 
@@ -167,41 +183,17 @@ class UnifiedScraper:
             "Upgrade-Insecure-Requests": "1"
         }
     
-    def _get_selenium_driver(self, use_brd=False):
-        """
-        Uses SeleniumAuthenticatedProxy to properly route traffic through BrightData.
-        This ensures the local IP is hidden and Amazon sees the proxy's location.
-        """
-        if use_brd:
-            print("🌐 Connecting to Bright Data Scraping Browser...")
-            # Use the AUTH from your .env (make sure WAL_AUTH is set)
-            auth = os.getenv('WAL_AUTH') 
-            server_addr = f'https://{auth}@brd.superproxy.io:9515'
-            connection = Connection(server_addr, 'goog', 'chrome')
-            driver = Remote(connection, options=Options())
-            return driver
-        else:
-            chrome_options = webdriver.ChromeOptions()
-            chrome_options.add_argument("--proxy-server=http://127.0.0.1:24000")
-            # chrome_options.add_argument('--ignore-certificate-errors')
-            
-            # chrome_options.add_argument('--allow-insecure-localhost')
-            chrome_options.add_argument("--disable-blink-features=AutomationControlled") 
-            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-            chrome_options.add_experimental_option('useAutomationExtension', False)
-            chrome_options.add_argument("--window-size=1280,800")
-            chrome_options.add_argument("--no-sandbox")          # needed in WSL
-            chrome_options.add_argument("--disable-dev-shm-usage")  # needed in WSL
-
-            # Force a standard User-Agent so we don't look like a headless scraper
-            chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-
-            service = Service(ChromeDriverManager().install())
-
-            # Initialize the standard Chrome driver
-            driver = webdriver.Chrome(service=service, options=chrome_options)
-            # driver = uc.Chrome(options=chrome_options, version_main=146)
-        
+    def _get_selenium_driver(self):
+        """Remote Bright Data Scraping Browser (WAL_AUTH, port 9515). Used for Amazon and Walmart."""
+        print("🌐 Connecting to Bright Data Scraping Browser...")
+        auth = os.getenv("WAL_AUTH")
+        if not auth:
+            raise ValueError("WAL_AUTH is not set in .env (required for Scraping Browser).")
+        server_addr = f"https://{auth}@brd.superproxy.io:9515"
+        connection = Connection(server_addr, "goog", "chrome")
+        driver = Remote(connection, options=Options())
+        driver.set_page_load_timeout(75)
+        driver.set_script_timeout(75)
         return driver
 
 
@@ -252,21 +244,133 @@ class UnifiedScraper:
             print("Gatekeeper page detected. Clicking 'Continue'...")
             button.click()
             time.sleep(2)
-        except:
-            pass # No gatekeeper found, move on
+        except Exception:
+            pass
+
+    def _amazon_search_url(self, category: str) -> str:
+        return f"https://www.amazon.com/s?k={quote_plus(category)}"
+
+    def _amazon_diagnose(self, driver) -> None:
+        try:
+            print(f"[Amazon] URL: {driver.current_url}")
+            print(f"[Amazon] Title: {driver.title}")
+        except Exception:
+            pass
+
+    def _amazon_is_blocked(self, url: str, html: str) -> bool:
+        blob = f"{url}\n{html[:12000]}".lower()
+        signals = (
+            "ap/signin",
+            "/signin",
+            "authportal",
+            "captcha",
+            "robot_check",
+            "automated access",
+            "sorry, we just need to make sure",
+            "type the characters you see",
+            "enter the characters you see",
+        )
+        return any(s in blob for s in signals)
+
+    def _parse_amazon_results(self, html: str, category: str, floor: float) -> int:
+        soup = BeautifulSoup(html, "html.parser")
+        items = soup.select('div[data-component-type="s-search-result"]')
+        if not items:
+            items = [tag for tag in soup.select("div[data-asin]") if tag.get("data-asin")]
+
+        stored = 0
+        for item in items:
+            try:
+                if item.select_one(".puis-sponsored-label-text"):
+                    continue
+                item_text = item.get_text(" ", strip=True).lower()
+                if "sponsored" in item_text[:80]:
+                    continue
+
+                asin = item.get("data-asin")
+                if not asin:
+                    continue
+
+                price = 0.0
+                offscreen = item.select_one("span.a-price span.a-offscreen")
+                if offscreen:
+                    price = self._clean_numeric(offscreen.get_text())
+                else:
+                    whole = item.select_one(".a-price-whole")
+                    fraction = item.select_one(".a-price-fraction")
+                    if whole and fraction:
+                        price = self._clean_numeric(
+                            f"{whole.get_text(strip=True).replace(',', '').strip('.')}.{fraction.get_text(strip=True)}"
+                        )
+
+                if price < floor:
+                    continue
+
+                img = item.select_one("img.s-image")
+                raw_title = (img.get("alt") if img else "") or ""
+                if not raw_title:
+                    link = item.select_one("h2 a span")
+                    raw_title = link.get_text(strip=True) if link else "Unknown Title"
+                brand_model = self._clean_product_data(raw_title, category)
+
+                reviews = 0
+                rev = item.select_one("span.s-underline-text")
+                if rev:
+                    reviews = int("".join(filter(str.isdigit, rev.get_text())) or 0)
+
+                self.db.upsert_item(
+                    (
+                        asin,
+                        "Amazon",
+                        self.today,
+                        category,
+                        brand_model,
+                        price,
+                        reviews,
+                        "In Stock",
+                        raw_title,
+                    )
+                )
+                print(f"Stored: [{asin}] {brand_model} | ${price}")
+                stored += 1
+            except Exception as e:
+                print(f"[Amazon] Item parse error: {e}")
+                continue
+
+        return stored
+
+    def run_amazon_discovery(self, categories, floors_by_category, max_attempts=3):
+        """Scrape Amazon search results via Bright Data Scraping Browser."""
+        print("--- Starting Amazon Phase ---")
+        driver = None
+        try:
+            driver = self._get_selenium_driver()
+            for category, floor in zip(categories, floors_by_category):
+                for attempt in range(1, max_attempts + 1):
+                    try:
+                        self.scrape_amazon(driver, category, floor)
+                        break
+                    except Exception as e:
+                        print(
+                            f"[Amazon] {category!r} failed (attempt {attempt}/{max_attempts}): {e}"
+                        )
+                        traceback.print_exc()
+                        retryable = _driver_fatal_exception(e) or isinstance(
+                            e, (RuntimeError, TimeoutException)
+                        )
+                        if attempt < max_attempts and retryable:
+                            print("[Amazon] Restarting browser before retry...")
+                            driver = _refresh_brd_driver(self, driver)
+                        elif attempt >= max_attempts:
+                            print(f"[Amazon] Giving up on {category!r}.")
+                time.sleep(random.uniform(5, 10))
+        finally:
+            if driver is not None:
+                driver.quit()
 
     def run_discovery(self, category, amazon_floor=50):
-        """Runs both engines and then reports deals."""
-        # 1. Amazon Engine (Selenium)
-        self.scrape_amazon(category, amazon_floor)
-        
-        # 2. Delay to prevent cross-site correlation
-        time.sleep(random.uniform(5, 10))
-        
-        # 3. Walmart Engine (curl_cffi)
-        self.scrape_walmart(category, amazon_floor)
- 
-        # 4. Intelligence Reporting
+        """Run Amazon for one category, then report deals (Walmart: use __main__ flow)."""
+        self.run_amazon_discovery([category], [amazon_floor])
         self.report_deals()
 
     def report_deals(self):
@@ -296,104 +400,56 @@ class UnifiedScraper:
     
     
 
-        # --- UPDATED AMAZON ENGINE ---
     def scrape_amazon(self, driver, category, floor):
+        """Amazon search via direct URL + CDP HTML parse (same pattern as Walmart)."""
         print(f"🚀 STARTING AMAZON: {category.upper()}")
-        wait = WebDriverWait(driver, 30)
-        
-        try:
-            driver.get("https://www.amazon.com")
-            # Check for Amazon's specialized block pages
-            # if "api-services-support" in driver.page_source or "captcha" in driver.current_url.lower():
-            #     print("🛑 CAPTCHA/Block detected. Solve it manually in the window.")
-            #     # This pause prevents the 'finally' block from closing the browser
-            #     input("Solve the captcha, then press Enter here to continue...")
+        search_url = self._amazon_search_url(category)
+        wait = WebDriverWait(driver, 60)
 
+        try:
+            driver.get(search_url)
             self._handle_interstitial(driver)
 
-            search_box = wait.until(EC.element_to_be_clickable((By.ID, "twotabsearchtextbox")))
-            search_box.clear()
-            search_box.send_keys(category + Keys.ENTER)
-            
-            # Wait for search results
-            wait.until(EC.presence_of_element_located((By.XPATH, '//div[@data-component-type="s-search-result"]')))
-            time.sleep(random.uniform(2, 4))
-            
             try:
-                wait.until(EC.presence_of_element_located((By.XPATH, '//div[@data-component-type="s-search-result"]')))
-                time.sleep(random.uniform(2, 4)) # Extra breathing room for images/prices to render
-            except TimeoutException:
-                print(f"Timeout waiting for results")
-
-            items = driver.find_elements(By.XPATH, '//div[@data-component-type="s-search-result"]')
-
-            for item in items:
-                try:
-                    is_sponsored = (
-                        "Sponsored" in item.text or 
-                        item.find_elements(By.CSS_SELECTOR, ".puis-sponsored-label-text") or
-                        item.find_elements(By.XPATH, ".//*[contains(@aria-label, 'Sponsored')]")
+                wait.until(
+                    EC.any_of(
+                        EC.presence_of_element_located(
+                            (By.CSS_SELECTOR, 'div[data-component-type="s-search-result"]')
+                        ),
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "div[data-asin]")),
+                        EC.presence_of_element_located((By.ID, "nav-logo-sprites")),
                     )
+                )
+            except TimeoutException:
+                print("[Amazon] Timed out waiting for page shell; parsing HTML anyway...")
 
-                    if is_sponsored:
-                        continue # SKIP IMMEDIATELY
-                    
-                    asin = item.get_attribute("data-asin")
-                    if not asin: continue
+            time.sleep(random.uniform(2, 5))
+            html = _brd_fetch_page_html(driver)
+            self._amazon_diagnose(driver)
 
-                    # Integration 2: Clean Numeric Price
-                    # try:
-                    #     whole = item.find_element(By.CLASS_NAME, 'a-price-whole').text
-                    #     fraction = item.find_element(By.CLASS_NAME, 'a-price-fraction').text
-                    #     price = _clean_numeric(f"{whole}.{fraction}")
-                    # except: 
-                    #     price = 0.0
+            if self._amazon_is_blocked(driver.current_url, html):
+                debug_path = f"amazon_debug_{category.replace(' ', '_')}.html"
+                with open(debug_path, "w", encoding="utf-8") as f:
+                    f.write(html)
+                raise RuntimeError(
+                    f"Amazon sign-in/CAPTCHA page (saved {debug_path}). "
+                    "Your Scraping Browser zone may need Amazon enabled in Bright Data."
+                )
 
-                    try:
-                        price_span = item.find_element(
-                            By.CSS_SELECTOR, 'span[aria-hidden="true"] .a-price-whole'
-                        )
-                        fraction_span = item.find_element(
-                            By.CSS_SELECTOR, 'span[aria-hidden="true"] .a-price-fraction'
-                        )
-                        whole = price_span.text.replace(",", "").strip(".")
-                        fraction = fraction_span.text.strip()
-                        price = self._clean_numeric(f"{whole}.{fraction}")
-                    except Exception:
-                        # Fallback: grab the full offscreen price string e.g. "$1,299.99"
-                        try:
-                            offscreen = item.find_element(
-                                By.CSS_SELECTOR, 'span.a-price span.a-offscreen'
-                            ).get_attribute("innerHTML")
-                            price = self._clean_numeric(offscreen)
-                        except:
-                            price = 0.0
-                    
-                    if price < floor: continue
+            stored = self._parse_amazon_results(html, category, floor)
+            if stored == 0:
+                debug_path = f"amazon_debug_{category.replace(' ', '_')}.html"
+                with open(debug_path, "w", encoding="utf-8") as f:
+                    f.write(html)
+                raise TimeoutException(
+                    f"No products parsed for {category!r} (saved {debug_path} for inspection)"
+                )
+            print(f"[Amazon] Stored {stored} items for {category!r}")
 
-                    # Integration 3: Clean Product Data (Title)
-                    raw_title = item.find_element(By.CSS_SELECTOR, "img.s-image").get_attribute("alt")
-                    brand_model = self._clean_product_data(raw_title, category)
-
-                    try:
-                        rev_text = item.find_element(By.XPATH, ".//span[contains(@class, 's-underline-text')]").text
-                        reviews = int("".join(filter(str.isdigit, rev_text)))
-                    except: reviews = 0
-
-                    # Save to Unified DB
-                    self.db.upsert_item((
-                        asin, 'Amazon', self.today, category, 
-                        brand_model, price, reviews, 'In Stock', raw_title
-                    ))
-                    print(f"Stored: [{asin}] {brand_model} | ${price}")
-
-                except Exception as e:
-                    print(f"Error: {e}")
-                    continue
         except Exception as e:
-            print(f"Error navigating... \n{e}")
-        # finally:
-            # driver.quit()
+            print(f"[Amazon] Error: {e!r}")
+            if _driver_fatal_exception(e) or isinstance(e, (RuntimeError, TimeoutException)):
+                raise
 
     def scrape_walmart(self, driver, product_url, floor):
         """
@@ -552,14 +608,14 @@ def get_product_links_from_search_page(driver, query, page_number=1):
             return []
 
 
-def _refresh_walmart_driver(bot, driver):
+def _refresh_brd_driver(bot, driver):
     """Safely close Bright Data / remote driver and open a new one."""
     try:
         if driver is not None:
             driver.quit()
     except Exception:
         pass
-    return bot._get_selenium_driver(use_brd=True)
+    return bot._get_selenium_driver()
 
 
 def _fetch_search_links_with_retries(bot, driver, category, max_attempts=3):
@@ -577,7 +633,7 @@ def _fetch_search_links_with_retries(bot, driver, category, max_attempts=3):
             traceback.print_exc()
             if attempt < max_attempts:
                 print("[Walmart] Restarting browser before retry...")
-                current = _refresh_walmart_driver(bot, current)
+                current = _refresh_brd_driver(bot, current)
             else:
                 print(f"[Walmart] Giving up on search for {category!r} after {max_attempts} attempts.")
     return current, []
@@ -585,34 +641,72 @@ def _fetch_search_links_with_retries(bot, driver, category, max_attempts=3):
 
 # --- REFINED MAIN EXECUTION ---
 if __name__ == "__main__":
-    # Your specific configuration
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Unified Amazon + Walmart market scraper")
+    parser.add_argument(
+        "--amazon-only",
+        action="store_true",
+        help="Run Amazon phase only (Bright Data Scraping Browser)",
+    )
+    parser.add_argument(
+        "--walmart-only",
+        action="store_true",
+        help="Run Walmart phase only (Bright Data Scraping Browser)",
+    )
+    parser.add_argument(
+        "--category",
+        metavar="NAME",
+        help="Scrape only this category (must exist in market_pov_config)",
+    )
+    args = parser.parse_args()
+    if args.amazon_only and args.walmart_only:
+        parser.error("Use only one of --amazon-only or --walmart-only")
+
+    run_amazon = not args.walmart_only
+    run_walmart = not args.amazon_only
+
     market_pov_config = {
         "laptop": 170,
         "monitor": 70,
         "smartwatch": 50,
         "air fryer": 30,
         "robot vacuum": 100,
-        "mechanical keyboard": 50
+        "mechanical keyboard": 50,
     }
 
     bot = UnifiedScraper()
 
-    # Task A: Amazon (Using undetected_chromedriver)
-    # print("--- Starting Amazon Phase ---")
-    # amazon_driver = bot._get_selenium_driver(use_brd=False)
-    # for cat, floor in market_pov_config.items():
-    #     bot.scrape_amazon(amazon_driver, cat, floor)
-    # amazon_driver.quit()
+    if args.category:
+        if args.category not in market_pov_config:
+            parser.error(
+                f"Unknown category {args.category!r}. "
+                f"Choose from: {', '.join(market_pov_config)}"
+            )
+        scrape_config = {args.category: market_pov_config[args.category]}
+    else:
+        scrape_config = market_pov_config
 
-    # Task B: Walmart (Using Bright Data Scraping Browser)
+    if run_amazon:
+        bot.run_amazon_discovery(
+            list(scrape_config.keys()),
+            list(scrape_config.values()),
+        )
+        if not run_walmart:
+            bot.report_deals()
+
+    if not run_walmart:
+        raise SystemExit(0)
+
+    # Task B: Walmart (Bright Data Scraping Browser)
     print("--- Starting Walmart Phase ---")
     walmart_driver = None
     product_counter = 0
     SESSION_LIMIT = 5  # Refresh driver every 5 products
 
     try:
-        walmart_driver = bot._get_selenium_driver(use_brd=True)
-        for cat, floor in market_pov_config.items():
+        walmart_driver = bot._get_selenium_driver()
+        for cat, floor in scrape_config.items():
             try:
                 walmart_driver, product_links = _fetch_search_links_with_retries(
                     bot, walmart_driver, cat, max_attempts=3
@@ -624,7 +718,7 @@ if __name__ == "__main__":
                 for link in product_links:
                     if product_counter >= SESSION_LIMIT:
                         print("♻️ Rotating Session to avoid detection/fatigue...")
-                        walmart_driver = _refresh_walmart_driver(bot, walmart_driver)
+                        walmart_driver = _refresh_brd_driver(bot, walmart_driver)
                         product_counter = 0
 
                     try:
@@ -634,14 +728,14 @@ if __name__ == "__main__":
                     except Exception as e:
                         print(f"⚠️ Scrape/session failure on product: {e}")
                         traceback.print_exc()
-                        walmart_driver = _refresh_walmart_driver(bot, walmart_driver)
+                        walmart_driver = _refresh_brd_driver(bot, walmart_driver)
                         product_counter = 0
 
                     time.sleep(random.uniform(2, 5))
             except Exception as e:
                 print(f"⚠️ Category {cat!r} aborted: {e}")
                 traceback.print_exc()
-                walmart_driver = _refresh_walmart_driver(bot, walmart_driver)
+                walmart_driver = _refresh_brd_driver(bot, walmart_driver)
                 product_counter = 0
                 continue
     finally:
