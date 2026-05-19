@@ -23,4 +23,8 @@ echo "=== Step 2: Scraping ==="
 python api_scraper.py --watchlist "$WATCHLIST" "$@"
 
 echo ""
+echo "=== Step 3: S3 Backup ==="
+python s3_backup.py || echo "  S3 backup skipped (check S3_BUCKET / AWS credentials in .env)"
+
+echo ""
 echo "Done."

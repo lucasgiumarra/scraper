@@ -28,6 +28,7 @@ from selenium.common.exceptions import TimeoutException
 
 from selenium.webdriver import Remote, ChromeOptions as Options
 from selenium.webdriver.chromium.remote_connection import ChromiumRemoteConnection as Connection
+from selenium.webdriver.remote.client_config import ClientConfig
 
 from market_scraper import (
     _brd_fetch_page_html,
@@ -46,7 +47,16 @@ def _get_brd_driver():
     auth = os.getenv("WAL_AUTH")
     if not auth:
         raise ValueError("WAL_AUTH is not set in .env")
-    connection = Connection(f"https://{auth}@brd.superproxy.io:9515", "goog", "chrome")
+    user, password = auth.split(":", 1)
+    client_config = ClientConfig(
+        remote_server_addr="https://brd.superproxy.io:9515",
+        username=user,
+        password=password,
+    )
+    connection = Connection(
+        "https://brd.superproxy.io:9515", "goog", "chrome",
+        client_config=client_config,
+    )
     driver = Remote(connection, options=Options())
     driver.set_page_load_timeout(75)
     driver.set_script_timeout(75)

@@ -28,6 +28,7 @@ Usage (mirrors market_scraper.py CLI):
 import os
 import re
 import json
+import sqlite3
 import argparse
 from datetime import datetime
 
@@ -40,6 +41,7 @@ from config import CATEGORIES
 load_dotenv()
 
 _API_BASE = "https://api.brightdata.com/datasets/v3"
+_DB_NAME = os.getenv("DB", "market_intelligence.db")
 
 # ── API helpers ───────────────────────────────────────────────────────────────
 
@@ -55,7 +57,6 @@ def _scrape(dataset_id: str, urls: list[str]) -> list[dict]:
     """
     POST URLs to /datasets/v3/scrape and return results directly.
     notify=false makes this synchronous — Bright Data blocks until done.
-    Each url entry can include optional zipcode/language fields per BRD docs.
     """
     inputs = [{"url": u} for u in urls]
     resp = requests.post(
@@ -75,18 +76,109 @@ def _scrape(dataset_id: str, urls: list[str]) -> list[dict]:
     return records
 
 
+# ── Products table ────────────────────────────────────────────────────────────
+
+_CREATE_PRODUCTS = """
+CREATE TABLE IF NOT EXISTS products (
+    external_id     TEXT NOT NULL,
+    source          TEXT NOT NULL,
+    category        TEXT,
+    last_updated    DATE,
+    raw_title       TEXT,
+    brand_model     TEXT,
+    brand           TEXT,
+    seller          TEXT,
+    rating          REAL,
+    review_count    INTEGER,
+    description     TEXT,
+    features        TEXT,
+    specs           TEXT,
+    image_url       TEXT,
+    initial_price   REAL,
+    currency        TEXT,
+    availability    TEXT,
+    is_available    INTEGER,
+    return_policy   TEXT,
+    model_number    TEXT,
+    manufacturer    TEXT,
+    weight          TEXT,
+    dimensions      TEXT,
+    condition       TEXT,
+    raw_json        TEXT,
+    PRIMARY KEY (external_id, source)
+)
+"""
+
+_UPSERT_PRODUCT = """
+INSERT INTO products (
+    external_id, source, category, last_updated, raw_title, brand_model,
+    brand, seller, rating, review_count, description, features, specs,
+    image_url, initial_price, currency, availability, is_available,
+    return_policy, model_number, manufacturer, weight, dimensions,
+    condition, raw_json
+) VALUES (
+    ?, ?, ?, ?, ?, ?,
+    ?, ?, ?, ?, ?, ?, ?,
+    ?, ?, ?, ?, ?,
+    ?, ?, ?, ?, ?,
+    ?, ?
+)
+ON CONFLICT(external_id, source) DO UPDATE SET
+    category      = excluded.category,
+    last_updated  = excluded.last_updated,
+    raw_title     = excluded.raw_title,
+    brand_model   = excluded.brand_model,
+    brand         = excluded.brand,
+    seller        = excluded.seller,
+    rating        = excluded.rating,
+    review_count  = excluded.review_count,
+    description   = excluded.description,
+    features      = excluded.features,
+    specs         = excluded.specs,
+    image_url     = excluded.image_url,
+    initial_price = excluded.initial_price,
+    currency      = excluded.currency,
+    availability  = excluded.availability,
+    is_available  = excluded.is_available,
+    return_policy = excluded.return_policy,
+    model_number  = excluded.model_number,
+    manufacturer  = excluded.manufacturer,
+    weight        = excluded.weight,
+    dimensions    = excluded.dimensions,
+    condition     = excluded.condition,
+    raw_json      = excluded.raw_json
+"""
+
+
+def _init_products_table(db_name: str):
+    with sqlite3.connect(db_name) as conn:
+        conn.execute(_CREATE_PRODUCTS)
+
+
+def _upsert_product(db_name: str, row: tuple):
+    with sqlite3.connect(db_name) as conn:
+        conn.execute(_UPSERT_PRODUCT, row)
+
+
+def _to_json(value) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value or None
+    return json.dumps(value, ensure_ascii=False)
+
+
 # ── Scraper class ─────────────────────────────────────────────────────────────
 
 class ApiScraper:
     """Scrape Amazon and Walmart via Bright Data Web Scraper API into UnifiedMarketDB."""
 
     def __init__(self):
-        self.db = UnifiedMarketDB()
+        self.db = UnifiedMarketDB(_DB_NAME)
+        _init_products_table(_DB_NAME)
         self.today = datetime.now().strftime("%Y-%m-%d")
         self.amz_dataset = os.getenv("AMZ_DATASET_ID")
         self.wal_dataset = os.getenv("WAL_DATASET_ID")
-
-    # Duplicated from UnifiedScraper — kept local to avoid coupling
 
     def _clean_numeric(self, text) -> float:
         if not text or "N/A" in str(text):
@@ -142,9 +234,7 @@ class ApiScraper:
                 if not asin:
                     continue
 
-                price = self._clean_numeric(
-                    r.get("final_price") or r.get("price") or 0
-                )
+                price = self._clean_numeric(r.get("final_price") or r.get("price") or 0)
                 if price < floor or price > ceiling:
                     continue
 
@@ -154,10 +244,42 @@ class ApiScraper:
                     r.get("reviews_count") or r.get("number_of_reviews") or 0
                 ))
 
+                # price_history row
                 self.db.upsert_item((
                     asin, "Amazon", self.today, category,
                     brand_model, price, reviews, "In Stock", raw_title,
                 ))
+
+                # products row — merge product_details (dict) into specs
+                specs_raw = r.get("product_details") or r.get("specifications") or r.get("specs")
+                _upsert_product(_DB_NAME, (
+                    asin,
+                    "Amazon",
+                    category,
+                    self.today,
+                    raw_title,
+                    brand_model,
+                    r.get("brand") or None,
+                    r.get("seller_name") or r.get("seller") or None,
+                    self._clean_numeric(r.get("rating") or 0) or None,
+                    reviews or None,
+                    r.get("description") or None,
+                    _to_json(r.get("features")),
+                    _to_json(specs_raw),
+                    r.get("image_url") or r.get("thumbnail") or None,
+                    self._clean_numeric(r.get("initial_price") or r.get("was_price") or 0) or None,
+                    r.get("currency") or "USD",
+                    r.get("availability") or "In Stock",
+                    int(bool(r.get("is_available", True))),
+                    r.get("return_policy") or None,
+                    r.get("model_number") or r.get("model") or None,
+                    r.get("manufacturer") or r.get("brand") or None,
+                    r.get("item_weight") or r.get("weight") or None,
+                    r.get("product_dimensions") or r.get("dimensions") or None,
+                    r.get("condition") or "New",
+                    json.dumps(r, ensure_ascii=False),
+                ))
+
                 print(f"  Stored: [{asin}] {brand_model} | ${price}")
                 stored += 1
             except Exception as e:
@@ -192,9 +314,7 @@ class ApiScraper:
                 if not item_id:
                     continue
 
-                price = self._clean_numeric(
-                    r.get("final_price") or r.get("price") or 0
-                )
+                price = self._clean_numeric(r.get("final_price") or r.get("price") or 0)
                 if price < floor or price > ceiling:
                     continue
 
@@ -205,10 +325,42 @@ class ApiScraper:
                 ))
                 availability = str(r.get("availability") or r.get("availability_text") or "Unknown")
 
+                # price_history row
                 self.db.upsert_item((
                     item_id, "Walmart", self.today, category,
                     brand_model, price, reviews, availability, raw_title,
                 ))
+
+                # products row — Walmart specs come as [{name, value}, ...]
+                specs_raw = r.get("specifications") or r.get("product_details") or r.get("specs")
+                _upsert_product(_DB_NAME, (
+                    item_id,
+                    "Walmart",
+                    category,
+                    self.today,
+                    raw_title,
+                    brand_model,
+                    r.get("brand") or None,
+                    r.get("seller") or r.get("seller_name") or None,
+                    self._clean_numeric(r.get("rating") or r.get("rating_stars") or 0) or None,
+                    reviews or None,
+                    r.get("description") or r.get("short_description") or None,
+                    _to_json(r.get("features")),
+                    _to_json(specs_raw),
+                    r.get("main_image") or r.get("image_url") or r.get("thumbnail") or None,
+                    self._clean_numeric(r.get("initial_price") or r.get("was_price") or 0) or None,
+                    r.get("currency") or "USD",
+                    availability,
+                    int(bool(r.get("is_available", True))),
+                    r.get("return_policy") or r.get("return_window") or None,
+                    r.get("model_number") or r.get("model") or r.get("gtin") or None,
+                    r.get("manufacturer") or r.get("brand") or None,
+                    r.get("weight") or None,
+                    r.get("dimensions") or None,
+                    r.get("condition") or "New",
+                    json.dumps(r, ensure_ascii=False),
+                ))
+
                 print(f"  Stored: [{item_id}] {brand_model} | ${price}")
                 stored += 1
             except Exception as e:

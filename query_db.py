@@ -1,5 +1,5 @@
 """
-query_db.py — Interactive DB explorer for market_intelligence.db
+query_db.py — Interactive DB explorer
 
 Usage:
     python query_db.py                     # interactive menu
@@ -10,9 +10,11 @@ Usage:
     python query_db.py --query cheapest
     python query_db.py --query category --filter laptop
     python query_db.py --query search --filter macbook
+    python query_db.py --query product --filter macbook
 """
 
 import os
+import json
 import sqlite3
 import argparse
 from dotenv import load_dotenv
@@ -162,6 +164,68 @@ def q_search(conn, filter_val=None):
         print(f"  [{source:<7}] ${price:<9.2f} {name[:45]}  ({cat}, {dt})")
 
 
+def q_product(conn, filter_val=None):
+    """Rich product metadata from the products table."""
+    term = filter_val or input("  Search term (or ASIN/SKU): ").strip()
+    print(f"\n=== PRODUCT DETAIL: '{term}' ===")
+    rows = conn.execute("""
+        SELECT source, brand_model, brand, seller, rating, review_count,
+               initial_price, availability, return_policy, model_number,
+               manufacturer, weight, dimensions, condition, last_updated,
+               description, features, specs
+        FROM products
+        WHERE LOWER(raw_title) LIKE LOWER(?)
+           OR LOWER(brand_model) LIKE LOWER(?)
+           OR external_id = ?
+        ORDER BY source, brand_model
+    """, (f"%{term}%", f"%{term}%", term)).fetchall()
+    if not rows:
+        print("  No matches.")
+    for (source, bm, brand, seller, rating, reviews, init_price,
+         avail, ret_policy, model, mfr, weight, dims, cond, updated,
+         desc, features, specs) in rows:
+        print(f"\n  [{source}] {bm}")
+        if brand:     print(f"    Brand:       {brand}")
+        if seller:    print(f"    Seller:      {seller}")
+        if rating:    print(f"    Rating:      {rating} ({'%d' % reviews if reviews else '?'} reviews)")
+        if init_price: print(f"    List price:  ${init_price:.2f}")
+        if avail:     print(f"    Avail:       {avail}")
+        if cond:      print(f"    Condition:   {cond}")
+        if model:     print(f"    Model:       {model}")
+        if mfr:       print(f"    Mfr:         {mfr}")
+        if weight:    print(f"    Weight:      {weight}")
+        if dims:      print(f"    Dimensions:  {dims}")
+        if ret_policy: print(f"    Returns:     {ret_policy}")
+        if updated:   print(f"    Updated:     {updated}")
+        if desc:
+            print(f"    Description: {desc[:200]}{'…' if len(desc or '') > 200 else ''}")
+        if features:
+            try:
+                feat_list = json.loads(features)
+                if isinstance(feat_list, list):
+                    print(f"    Features ({len(feat_list)}):")
+                    for f in feat_list[:5]:
+                        print(f"      • {str(f)[:100]}")
+            except Exception:
+                pass
+        if specs:
+            try:
+                spec_data = json.loads(specs)
+                if isinstance(spec_data, list) and spec_data:
+                    print(f"    Specs ({len(spec_data)}):")
+                    for s in spec_data[:8]:
+                        if isinstance(s, dict):
+                            k = s.get("name") or s.get("key") or ""
+                            v = s.get("value") or ""
+                            print(f"      {k}: {v}")
+                elif isinstance(spec_data, dict):
+                    print(f"    Specs ({len(spec_data)}):")
+                    for k, v in list(spec_data.items())[:8]:
+                        print(f"      {k}: {v}")
+            except Exception:
+                pass
+
+
 QUERIES = {
     "summary":  q_summary,
     "prices":   q_prices,
@@ -170,6 +234,7 @@ QUERIES = {
     "cheapest": q_cheapest,
     "category": q_category,
     "search":   q_search,
+    "product":  q_product,
 }
 
 MENU = """
@@ -180,12 +245,13 @@ MENU = """
   5. cheapest  — top 10 cheapest per source
   6. category  — all prices for one category
   7. search    — search by product name
+  8. product   — rich metadata (brand, specs, description, …)
   q. quit
 """
 
 
 def interactive(conn):
-    key_map = {"1": "summary", "2": "prices", "3": "drops","4": "history", "5": "cheapest", "6": "category", "7": "search"}
+    key_map = {"1": "summary", "2": "prices", "3": "drops", "4": "history", "5": "cheapest", "6": "category", "7": "search", "8": "product"}
     while True:
         print(MENU)
         choice = input("  Choose: ").strip().lower()
@@ -201,7 +267,7 @@ def interactive(conn):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Explore market_intelligence.db")
+    parser = argparse.ArgumentParser(description="Explore the db")
     parser.add_argument("--query", choices=list(QUERIES), metavar="NAME",
                         help=f"Query to run: {', '.join(QUERIES)}")
     parser.add_argument("--filter", metavar="VALUE",
